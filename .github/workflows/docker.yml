@@ -1,0 +1,95 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel a superseded build on the same PR/branch — image builds are the slowest
+# job in the repo and there is no value in finishing one for a stale commit.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  # metadata-action lowercases this for us; GHCR rejects the mixed-case repo name.
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Only consumed by the push step below; a pull_request run never reaches it.
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Built and loaded into the local daemon first so the smoke test below runs
+      # against the exact image we are about to publish, rather than publishing
+      # an image nothing has executed. The push step re-uses this build's cache,
+      # so the second pass is a cache hit and costs seconds.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: aegisgate:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Cheap, deterministic checks: the dependency install actually landed, and
+      # the image did not silently revert to running as root. Deliberately does
+      # not boot uvicorn — init_config runs under AEGIS_INIT_STRICT and wants a
+      # config volume, which would make this step fail for reasons unrelated to
+      # the Dockerfile.
+      - name: Smoke test image
+        run: |
+          docker run --rm aegisgate:ci \
+            python -c "import aegisgate; print('aegisgate', aegisgate.__version__)"
+          docker run --rm aegisgate:ci python -c "import fastapi, uvicorn, httpx"
+          uid="$(docker run --rm aegisgate:ci id -u)"
+          if [ "$uid" != "10001" ]; then
+            echo "image runs as uid $uid, expected the non-root 10001" >&2
+            exit 1
+          fi
+
+      - name: Log in to ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
